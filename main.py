@@ -1,5 +1,4 @@
 import os
-import json
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -7,6 +6,7 @@ from telegram.ext import (
     ContextTypes,
     ChatJoinRequestHandler,
 )
+from pymongo import MongoClient
 
 # Load environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -21,36 +21,45 @@ except:
     print(f"❌ Invalid ADMIN_ID: {admin_id_raw}")
     ADMIN_ID = None
 
-# Load users from file or start with empty set
-if os.path.exists("users.json"):
-    with open("users.json", "r") as f:
-        users = set(json.load(f))
-else:
-    users = set()
+# --- MongoDB Setup ---
+MONGO_URL = os.getenv("MONGO_URL")
+client = MongoClient(MONGO_URL)
+db = client["my_bot_db"]       # You can rename this database
+users_col = db["users"]        # Collection to store users
 
-# Function to save users to users.json
-def save_users():
-    with open("users.json", "w") as f:
-        json.dump(list(users), f)
+
+# --- Helper functions for MongoDB users ---
+
+async def is_user_in_db(user_id: int) -> bool:
+    return users_col.find_one({"user_id": user_id}) is not None
+
+async def add_user_to_db(user_id: int):
+    if not await is_user_in_db(user_id):
+        users_col.insert_one({"user_id": user_id})
+
 
 # /start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in users:
-        users.add(user_id)
-        save_users()
-        if LOG_CHANNEL_ID:
-            await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=f"🆕 New user: {user_id}")
-    await update.message.reply_text("Welcome Bro , Just Add me to your channel / Group and i will accept the join requests For you!")
+    await add_user_to_db(user_id)
+
+    if LOG_CHANNEL_ID:
+        await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=f"🆕 New user: {user_id}")
+
+    await update.message.reply_text(
+        "Welcome Bro , Just Add me to your channel / Group and i will accept the join requests For you!"
+    )
+
 
 # Auto-approve join requests
 async def join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.chat_join_request.chat.id
     user_id = update.chat_join_request.from_user.id
     await context.bot.approve_chat_join_request(chat_id, user_id)
-    
+
     if LOG_CHANNEL_ID:
         await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=f"✅ Approved: {user_id}")
+
 
 # /broadcast command (admin only)
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -61,29 +70,35 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     success, fail = 0, 0
     sent_type = "text"
-    
+
+    # Get all user IDs from MongoDB
+    all_users = users_col.find({}, {"user_id": 1})
+    user_ids = [user["user_id"] for user in all_users]
+
     # Reply-to broadcast
     if update.message.reply_to_message:
         original = update.message.reply_to_message
-        for user_id in users:
+        for user_id in user_ids:
             try:
                 await context.bot.copy_message(
                     chat_id=user_id,
                     from_chat_id=update.effective_chat.id,
-                    message_id=original.message_id
+                    message_id=original.message_id,
                 )
                 success += 1
             except:
                 fail += 1
         sent_type = "forward"
-    
+
     # Direct text broadcast
     else:
-        message = ' '.join(context.args)
+        message = " ".join(context.args)
         if not message:
-            await update.message.reply_text("⚠️ Usage: reply to a message with /broadcast OR use /broadcast <text>")
+            await update.message.reply_text(
+                "⚠️ Usage: reply to a message with /broadcast OR use /broadcast <text>"
+            )
             return
-        for user_id in users:
+        for user_id in user_ids:
             try:
                 await context.bot.send_message(chat_id=user_id, text=message)
                 success += 1
@@ -94,7 +109,10 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(result_msg)
 
     if LOG_CHANNEL_ID:
-        await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=f"📢 Broadcast ({sent_type}) by {sender_id}\n{result_msg}")
+        await context.bot.send_message(
+            chat_id=LOG_CHANNEL_ID, text=f"📢 Broadcast ({sent_type}) by {sender_id}\n{result_msg}"
+        )
+
 
 # /stats command (admin only)
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -105,11 +123,15 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Unauthorized.")
         return
 
-    total_users = len(users)
+    total_users = users_col.count_documents({})
     await update.message.reply_text(f"📊 Total users: {total_users}")
 
     if LOG_CHANNEL_ID:
-        await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=f"📈 Stats requested by {sender_id}: {total_users} users.")
+        await context.bot.send_message(
+            chat_id=LOG_CHANNEL_ID,
+            text=f"📈 Stats requested by {sender_id}: {total_users} users.",
+        )
+
 
 # /users command (admin only)
 async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -118,12 +140,15 @@ async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Unauthorized.")
         return
 
-    if not users:
+    user_cursor = users_col.find({}, {"user_id": 1})
+    user_ids = [str(user["user_id"]) for user in user_cursor]
+
+    if not user_ids:
         await update.message.reply_text("No users found.")
         return
 
-    user_list = "\n".join(str(uid) for uid in users)
-    response = f"👥 Total users: {len(users)}\n\n{user_list}"
+    user_list = "\n".join(user_ids)
+    response = f"👥 Total users: {len(user_ids)}\n\n{user_list}"
 
     if len(response) > 4000:
         with open("user_ids.txt", "w") as f:
@@ -135,8 +160,9 @@ async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if LOG_CHANNEL_ID:
         await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=f"📤 /users command used by {sender_id}")
 
+
 # Run the bot
-if __name__ == '__main__':
+if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
