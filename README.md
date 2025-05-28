@@ -1,5 +1,4 @@
 # Auto-accepting-repo
-# Telegram Channel Bot
 
 A Telegram bot that auto-approves channel join requests and supports admin broadcast messages.
 
